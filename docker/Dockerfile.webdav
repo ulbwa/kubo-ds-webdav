@@ -1,0 +1,32 @@
+# A minimal Apache mod_dav WebDAV server used to verify the datastore against a
+# real, production-representative WebDAV implementation (atomic MOVE, full
+# PROPFIND). For testing only — no auth, no TLS.
+FROM httpd:2.4-alpine
+
+# mod_dav_fs needs an apr_dbm backend for its (mandatory) lock database, which
+# the base image does not ship. Under concurrent writes gdbm can transiently
+# fail to open the shared lock DB and return 500 — the datastore retries those
+# idempotent operations with backoff, which is also how it copes with real
+# WebDAV servers under load.
+RUN apk add --no-cache apr-util-dbm_gdbm
+
+# Enable the DAV modules (mod_autoindex is already loaded for directory listings).
+RUN sed -i \
+      -e 's|^#\(LoadModule dav_module .*\)|\1|' \
+      -e 's|^#\(LoadModule dav_fs_module .*\)|\1|' \
+      conf/httpd.conf
+
+# A writable, DAV-enabled document root with the required lock database.
+RUN printf '\n\
+DavLockDB "/tmp/DavLock"\n\
+<Directory "/usr/local/apache2/htdocs">\n\
+    Dav On\n\
+    Options Indexes FollowSymLinks\n\
+    AllowOverride None\n\
+    Require all granted\n\
+</Directory>\n' >> conf/httpd.conf \
+ && chmod -R 0777 /usr/local/apache2/htdocs
+
+EXPOSE 80
+HEALTHCHECK --interval=2s --timeout=3s --retries=40 \
+  CMD wget -q -O /dev/null http://localhost/ || exit 1

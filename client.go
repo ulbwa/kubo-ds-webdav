@@ -57,12 +57,21 @@ func newClient(cfg Config) (*client, error) {
 		WriteBufferSize:       64 << 10,
 		ReadBufferSize:        64 << 10,
 	}
+	hc := &http.Client{
+		Transport: tr,
+		// Never auto-follow redirects: Go would rewrite a redirected PROPFIND
+		// into a GET and hand us an HTML page instead of a multistatus body.
+		// Our operations use exact paths, so a redirect is always an error.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	return &client{
 		cfg:      cfg,
 		urlBase:  cfg.URL,
 		root:     cfg.RootDirectory,
 		rootPath: rootPath,
-		hc:       &http.Client{Transport: tr},
+		hc:       hc,
 		sem:      make(chan struct{}, cfg.Concurrency),
 	}, nil
 }
@@ -217,31 +226,42 @@ func (c *client) size(ctx context.Context, p string) (int64, error) {
 }
 
 func (c *client) delete(ctx context.Context, p string) error {
-	resp, err := c.do(ctx, http.MethodDelete, p, nil, nil)
-	if err != nil {
-		return err
-	}
-	defer drain(resp)
-	if resp.StatusCode == http.StatusNotFound {
-		return nil // idempotent
-	}
-	if resp.StatusCode/100 == 2 {
-		return nil
-	}
-	return statusErr("DELETE", p, resp)
+	return c.withRetry(ctx, func() error {
+		resp, err := c.do(ctx, http.MethodDelete, p, nil, nil)
+		if err != nil {
+			return err
+		}
+		defer drain(resp)
+		if resp.StatusCode == http.StatusNotFound {
+			return nil // idempotent
+		}
+		if resp.StatusCode/100 == 2 {
+			return nil
+		}
+		return statusErr("DELETE", p, resp)
+	})
 }
 
 func (c *client) move(ctx context.Context, from, to string) error {
+	first := true
 	return c.withRetry(ctx, func() error {
 		resp, err := c.do(ctx, "MOVE", from, nil, map[string]string{
 			"Destination": c.fullURL(c.fullPath(to)),
 			"Overwrite":   "T",
 		})
+		isFirst := first
+		first = false
 		if err != nil {
 			return err
 		}
 		defer drain(resp)
 		if resp.StatusCode/100 == 2 {
+			return nil
+		}
+		// MOVE is not idempotent: if a prior attempt transiently reported 5xx
+		// but actually moved the (unique) temp source, the retry sees a 404.
+		// Treat a not-first-attempt 404 as success.
+		if resp.StatusCode == http.StatusNotFound && !isFirst {
 			return nil
 		}
 		return statusErr("MOVE", from, resp)
@@ -250,19 +270,20 @@ func (c *client) move(ctx context.Context, from, to string) error {
 
 // mkcolRaw creates a single collection at an already-root-prefixed path.
 func (c *client) mkcolRaw(ctx context.Context, fullpath string) error {
-	resp, err := c.doAbs(ctx, "MKCOL", fullpath, nil, nil)
-	if err != nil {
-		return err
-	}
-	defer drain(resp)
-	switch resp.StatusCode {
-	case http.StatusMethodNotAllowed: // already exists
-		return nil
-	}
-	if resp.StatusCode/100 == 2 {
-		return nil
-	}
-	return statusErr("MKCOL", fullpath, resp)
+	return c.withRetry(ctx, func() error {
+		resp, err := c.doAbs(ctx, "MKCOL", fullpath, nil, nil)
+		if err != nil {
+			return err
+		}
+		defer drain(resp)
+		if resp.StatusCode == http.StatusMethodNotAllowed { // already exists
+			return nil
+		}
+		if resp.StatusCode/100 == 2 {
+			return nil
+		}
+		return statusErr("MKCOL", fullpath, resp)
+	})
 }
 
 // mkcolAll creates a key-relative collection and all its ancestors (including
@@ -287,15 +308,22 @@ func (c *client) mkcolAll(ctx context.Context, p string) error {
 	return nil
 }
 
-// options probes the server; returns the Allow and DAV headers.
+// options probes the server (on our root collection); returns Allow and DAV.
 func (c *client) options(ctx context.Context) (allow, dav string, err error) {
-	resp, err := c.do(ctx, http.MethodOptions, "", nil, nil)
+	// Target the root collection with a trailing slash, else a server redirects
+	// the slash-less collection URL (301) and, since we don't follow redirects,
+	// the probe would fail.
+	target := c.fullPath("")
+	if target != "" {
+		target += "/"
+	}
+	resp, err := c.doAbs(ctx, http.MethodOptions, target, nil, nil)
 	if err != nil {
 		return "", "", err
 	}
 	defer drain(resp)
 	if resp.StatusCode/100 != 2 {
-		return "", "", statusErr("OPTIONS", "", resp)
+		return "", "", statusErr("OPTIONS", target, resp)
 	}
 	return resp.Header.Get("Allow"), resp.Header.Get("DAV"), nil
 }
@@ -308,16 +336,20 @@ func statusErr(method, p string, resp *http.Response) error {
 
 func isRetryableStatus(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests, http.StatusBadGateway,
+	case http.StatusInternalServerError, // transient lock-DB / load failures
+		http.StatusTooManyRequests, http.StatusBadGateway,
 		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
 	return false
 }
 
-// withRetry retries idempotent operations on transient errors with backoff.
+// withRetry retries idempotent operations on transient errors with jittered
+// exponential backoff. Jitter is important: concurrent writers that all hit a
+// server-side lock-DB contention 5xx must not retry in lockstep, or they just
+// re-collide.
 func (c *client) withRetry(ctx context.Context, fn func() error) error {
-	const maxAttempts = 4
+	const maxAttempts = 6
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		err = fn()
@@ -335,13 +367,21 @@ func (c *client) withRetry(ctx context.Context, fn func() error) error {
 		if !retry || attempt == maxAttempts-1 {
 			return err
 		}
+		base := time.Duration(1<<attempt) * 50 * time.Millisecond
+		jitter := time.Duration(time.Now().UnixNano() % int64(base))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(1<<attempt) * 100 * time.Millisecond):
+		case <-time.After(base + jitter):
 		}
 	}
 	return err
+}
+
+// is404 reports whether err is a WebDAV 404 (Not Found) status error.
+func is404(err error) bool {
+	var se *statusError
+	return errors.As(err, &se) && se.code == http.StatusNotFound
 }
 
 // statusError carries the HTTP status code for retry decisions.

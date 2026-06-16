@@ -1,0 +1,15 @@
+# WebDAV backend for integration and end-to-end tests.
+#
+#   docker compose up -d --build --wait webdav
+#   WEBDAV_TEST_URL=http://127.0.0.1:8091 go test -tags integration ./...
+#
+# Uses Apache mod_dav — the most production-representative WebDAV server
+# (synchronous directory creation, reliable atomic MOVE, full PROPFIND). The
+# plugin works against any compliant WebDAV server (Nextcloud, Apache, rclone).
+services:
+  webdav:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.webdav
+    ports:
+      - "8091:80"

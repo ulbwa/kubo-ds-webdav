@@ -1,0 +1,49 @@
+# End-to-end topology: ONE WebDAV backend shared by TWO independent kubo nodes.
+# Each node has its own local repo (identity, config, repo.lock) but the entire
+# datastore (blocks + pins + metadata) lives in the shared WebDAV under the same
+# rootDirectory. Proves blocks are physically in WebDAV and a second node reads
+# them straight from shared storage.
+services:
+  webdav:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.webdav
+
+  # Writer node (full daemon).
+  kubo-a:
+    image: kubo-ds-webdav:e2e
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      webdav:
+        condition: service_healthy
+    entrypoint: ["sh", "/e2e/kubo-entrypoint.sh"]
+    command: ["daemon"]
+    environment:
+      WEBDAV_URL: "http://webdav:80"
+      WEBDAV_ROOT: "shared"
+    volumes:
+      - ./kubo-entrypoint.sh:/e2e/kubo-entrypoint.sh:ro
+      - kubo-a-repo:/data/ipfs
+
+  # Follower node (offline daemon, read-mostly: noDelete). Reads blocks only
+  # from the shared WebDAV — no swarm, no bitswap.
+  kubo-b:
+    image: kubo-ds-webdav:e2e
+    depends_on:
+      webdav:
+        condition: service_healthy
+    entrypoint: ["sh", "/e2e/kubo-entrypoint.sh"]
+    command: ["daemon", "--offline"]
+    environment:
+      WEBDAV_URL: "http://webdav:80"
+      WEBDAV_ROOT: "shared"
+      WEBDAV_NODELETE: "1"
+    volumes:
+      - ./kubo-entrypoint.sh:/e2e/kubo-entrypoint.sh:ro
+      - kubo-b-repo:/data/ipfs
+
+volumes:
+  kubo-a-repo:
+  kubo-b-repo:

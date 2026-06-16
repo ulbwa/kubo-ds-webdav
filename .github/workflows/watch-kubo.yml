@@ -1,0 +1,79 @@
+name: Watch kubo releases
+
+# Detects new stable kubo releases and triggers a build for them, mirroring
+# ulbwa/kubo-ds-s3. State is derived from this repo's existing release tags
+# (v<kubo>+build.<N>), so no extra storage is needed.
+#
+# A tag pushed by GITHUB_TOKEN would NOT trigger release.yml (GitHub suppresses
+# recursive workflow runs), so we dispatch release.yml explicitly instead; it
+# creates the tag + GitHub release itself.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      kubo_version:
+        description: "Specific kubo version (e.g. v0.37.0); empty = latest stable"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if already built (bumps build.N)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: watch-kubo
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide and dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_KUBO: ${{ github.event.inputs.kubo_version }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # 1) Target kubo version: input, or latest stable release.
+          if [ -n "${INPUT_KUBO:-}" ]; then
+            KUBO="$INPUT_KUBO"
+            echo "$KUBO" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              || { echo "::error::'$KUBO' is not a stable vX.Y.Z release"; exit 1; }
+          else
+            KUBO=$(gh api --paginate repos/ipfs/kubo/releases \
+              --jq '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          fi
+          [ -n "$KUBO" ] || { echo "::error::no stable kubo release found"; exit 1; }
+
+          # 2) Existing builds for this kubo version (state = release tags).
+          PREFIX="${KUBO}+build."
+          EXISTING=$(gh api --paginate repos/${GITHUB_REPOSITORY}/tags --jq '.[].name' \
+            | grep -F "$PREFIX" || true)
+          FORCE="${INPUT_FORCE:-false}"
+
+          if [ -z "$EXISTING" ]; then
+            REV=1; BUILD=true
+          elif [ "$FORCE" = "true" ]; then
+            MAX=$(echo "$EXISTING" | sed "s#.*+build\.##" | sort -n | tail -n1)
+            REV=$((MAX+1)); BUILD=true
+          else
+            REV=0; BUILD=false
+          fi
+
+          if [ "$BUILD" != "true" ]; then
+            echo "::notice::kubo $KUBO already built; nothing to do."
+            exit 0
+          fi
+
+          TAG="${KUBO}+build.${REV}"
+          echo "::notice::dispatching release for $TAG"
+          gh workflow run release.yml -f tag="$TAG"

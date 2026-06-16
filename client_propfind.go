@@ -53,26 +53,38 @@ func (c *client) propfind(ctx context.Context, p string, depth int) ([]davEntry,
 	case depth < 0:
 		d = "infinity"
 	}
-	resp, err := c.do(ctx, "PROPFIND", p, []byte(propfindBody), map[string]string{
-		"Depth":        d,
-		"Content-Type": "application/xml; charset=utf-8",
+	// Listing a collection requires a trailing slash, else servers (Apache
+	// mod_dav) answer with a 301 redirect to the slash form. Compute the slash
+	// on the full (root-prefixed) path so the root collection is covered too.
+	full := c.fullPath(p)
+	if depth != 0 && full != "" && !strings.HasSuffix(full, "/") {
+		full += "/"
+	}
+
+	var ms msMultistatus
+	err := c.withRetry(ctx, func() error {
+		resp, err := c.doAbs(ctx, "PROPFIND", full, []byte(propfindBody), map[string]string{
+			"Depth":        d,
+			"Content-Type": "application/xml; charset=utf-8",
+		})
+		if err != nil {
+			return err
+		}
+		defer drain(resp)
+		if resp.StatusCode == http.StatusNotFound {
+			return errNotFound
+		}
+		if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode/100 != 2 {
+			return statusErr("PROPFIND", p, resp)
+		}
+		body, rerr := io.ReadAll(resp.Body)
+		if rerr != nil {
+			return rerr
+		}
+		ms = msMultistatus{}
+		return xml.Unmarshal(body, &ms)
 	})
 	if err != nil {
-		return nil, err
-	}
-	defer drain(resp)
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, errNotFound
-	}
-	if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode/100 != 2 {
-		return nil, statusErr("PROPFIND", p, resp)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var ms msMultistatus
-	if err := xml.Unmarshal(body, &ms); err != nil {
 		return nil, err
 	}
 
