@@ -9,12 +9,14 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
 ARG KUBO_VERSION=v0.37.0
 ARG TARGETARCH
 
-# The plugin source (this repo) is copied in and wired into kubo via a replace
-# directive, so the image always matches the committed code.
-COPY . /src/kubo-ds-webdav
-
+# Clone kubo first so this layer stays cached when only the plugin source
+# changes.
 RUN git clone --depth 1 --branch "${KUBO_VERSION}" https://github.com/ipfs/kubo /kubo
 WORKDIR /kubo
+
+# The plugin source (this repo) is wired into kubo via a replace directive, so
+# the image always matches the committed code.
+COPY . /src/kubo-ds-webdav
 RUN go mod edit -replace github.com/ulbwa/kubo-ds-webdav=/src/kubo-ds-webdav \
  && printf '\nwebdavds github.com/ulbwa/kubo-ds-webdav/plugin 0\n' >> plugin/loader/preload_list \
  && make plugin/loader/preload.go \

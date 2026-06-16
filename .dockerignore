@@ -1,0 +1,11 @@
+# Keep the bundle build context lean and its cache stable: only the Go module
+# (go.mod/go.sum + *.go) is needed to compile the plugin into kubo.
+.git
+.github
+docs
+test
+docker
+docker-compose.yml
+*.md
+*.so
+LICENSE
