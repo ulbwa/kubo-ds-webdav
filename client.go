@@ -269,14 +269,18 @@ func (c *client) move(ctx context.Context, from, to string) error {
 }
 
 // mkcolRaw creates a single collection at an already-root-prefixed path.
+// The trailing slash matters: MKCOL on an EXISTING collection without one makes
+// Apache redirect (301) to the slash form, which we must not treat as an error.
 func (c *client) mkcolRaw(ctx context.Context, fullpath string) error {
 	return c.withRetry(ctx, func() error {
-		resp, err := c.doAbs(ctx, "MKCOL", fullpath, nil, nil)
+		resp, err := c.doAbs(ctx, "MKCOL", fullpath+"/", nil, nil)
 		if err != nil {
 			return err
 		}
 		defer drain(resp)
-		if resp.StatusCode == http.StatusMethodNotAllowed { // already exists
+		switch resp.StatusCode {
+		case http.StatusMethodNotAllowed, // already exists
+			http.StatusMovedPermanently, http.StatusFound: // existing collection redirect
 			return nil
 		}
 		if resp.StatusCode/100 == 2 {

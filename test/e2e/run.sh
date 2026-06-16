@@ -18,7 +18,11 @@ echo "==> Building bundled kubo image and starting WebDAV + node A"
 wait_daemon() { # $1 = service
   echo "    waiting for $1 daemon..."
   for _ in $(seq 1 60); do
-    if "${COMPOSE[@]}" exec -T "$1" ipfs id >/dev/null 2>&1; then return 0; fi
+    # Probe the daemon's HTTP API. Do NOT use `ipfs id`: with no daemon yet it
+    # runs offline and grabs repo.lock, which then blocks the starting daemon.
+    if "${COMPOSE[@]}" exec -T "$1" wget -qO- --post-data='' http://127.0.0.1:5001/api/v0/id >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 2
   done
   echo "FAIL: $1 daemon did not become ready"; "${COMPOSE[@]}" logs "$1" | tail -30; exit 1

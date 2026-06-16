@@ -6,7 +6,7 @@
 services:
   webdav:
     build:
-      context: ..
+      context: ../..
       dockerfile: docker/Dockerfile.webdav
 
   # Writer node (full daemon).
