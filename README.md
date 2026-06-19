@@ -52,9 +52,9 @@ remove a block another node still references).
 
 ## Install
 
-The plugin ships three ways. Prefer the **bundled** binary/image — Go's runtime
-plugin (`.so`) must be built with the exact kubo version *and* Go toolchain of
-the host `ipfs`, so it is fragile.
+The datastore is **bundled into kubo at build time** (preload — no CGO, no
+runtime `.so` loading), so a single self-contained `ipfs` is published. Use the
+image or the binary.
 
 ### Bundled Docker image (recommended)
 
@@ -64,15 +64,21 @@ docker pull ghcr.io/ulbwa/kubo-ds-webdav:v0.37.0   # kubo + webdavds compiled in
 
 ### Bundled binary
 
-Download `kubo-ds-webdav_kubo-<version>_linux-<arch>` from the
+Download `kubo-ds-webdav_kubo-<version>_linux-amd64` from the
 [Releases](https://github.com/ulbwa/kubo-ds-webdav/releases) — a drop-in `ipfs`
-with `webdavds` compiled in (linux amd64 + arm64).
+(linux/amd64) with `webdavds` compiled in. Verify it with the `.sha256`.
 
-### `.so` plugin (linux/amd64 only)
+### Runtime `.so` plugin (build it yourself)
 
-Download `kubo-ds-webdav_<tag>_linux-amd64.so`, drop it into `~/.ipfs/plugins/`,
-and run the **matching official kubo release**. The `.so` is published for
-linux/amd64 only (Go plugins are restricted, and the ABI must match exactly).
+A Go runtime plugin is **not** published, because a `.so` must be built with the
+exact kubo version *and* Go toolchain of the host `ipfs` (the ABI must match
+exactly), which is fragile. If you need one, build it against a pinned kubo and
+drop it into `~/.ipfs/plugins/`:
+
+```bash
+./set-target.sh v0.37.0    # align go.mod with that kubo release
+make plugin                # -> kubo-ds-webdav.so (linux/amd64, CGO)
+```
 
 ## Configure the datastore
 
@@ -138,7 +144,15 @@ with any RFC-4918 WebDAV server (Nextcloud, Apache, rclone, …).
 
 ## Releases / CI
 
-- **`release.yml`** runs on a `v*` tag: tests, then publishes the linux/amd64
-  `.so`, bundled images (amd64+arm64) to GHCR, and bundled binaries.
-- **`watch-kubo.yml`** runs weekly: when a new stable kubo release appears it
-  triggers a build for it. Tags are `v<kubo-version>+build.<N>`.
+A single workflow, **`watch-and-build.yml`** (modeled on
+[`ulbwa/kubo-ds-s3`](https://github.com/ulbwa/kubo-ds-s3)), builds kubo with
+`webdavds` compiled in and publishes a Docker image (GHCR) + a standalone `ipfs`
+binary (linux/amd64). It runs tests first, then builds. It triggers on:
+
+- **a `v*` tag** pushed here (`v<kubo-version>+build.<N>`, e.g. `v0.37.0+build.1`)
+  — an explicit, manual release;
+- **a new stable kubo release** — a weekly cron checks `ipfs/kubo` and builds the
+  new version automatically (state derived from existing releases);
+- **manual dispatch** — pick a kubo version or force a rebuild.
+
+Image tags: `:<kubo-version>`, `:<kubo-version>-build.<N>`, `:latest`.

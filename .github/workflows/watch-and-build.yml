@@ -1,0 +1,237 @@
+name: Watch kubo & build bundled kubo-ds-webdav
+
+# Builds kubo with the webdavds datastore compiled in (preload, no CGO, no .so)
+# and publishes a Docker image (GHCR) + a standalone ipfs binary (Release),
+# linux/amd64. Modeled on ulbwa/kubo-ds-s3, with one addition: it also triggers
+# on this repo's own tags.
+#
+# Triggers:
+#   * push tag v*          -> build exactly that tag (manual release)
+#   * schedule / dispatch  -> watch ipfs/kubo for a new stable release and build it
+#
+# State (for the watcher) is derived from this repo's existing releases: each
+# release records the source commit in a build-meta comment, so no extra storage.
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      kubo_version:
+        description: "Specific kubo version (e.g. v0.37.0); empty = latest stable"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if nothing changed (bumps build.N)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  KUBO_REPO: ipfs/kubo
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.d.outputs.should_build }}
+      tag: ${{ steps.d.outputs.tag }}
+      kubo_version: ${{ steps.d.outputs.kubo_version }}
+      go_version: ${{ steps.d.outputs.go_version }}
+    steps:
+      - id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_KUBO: ${{ github.event.inputs.kubo_version }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "push" ]; then
+            # A tag push (v<kubo>+build.<N>): build exactly this tag.
+            TAG="$REF_NAME"
+            KUBO="${TAG%%+*}"
+            echo "$KUBO" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              || { echo "::error::tag '$TAG' must start with v<MAJOR>.<MINOR>.<PATCH>"; exit 1; }
+            BUILD=true
+          else
+            # schedule / workflow_dispatch: watch for a kubo version to build.
+            if [ -n "${INPUT_KUBO:-}" ]; then
+              KUBO="$INPUT_KUBO"
+              echo "$KUBO" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                || { echo "::error::'$KUBO' is not a stable vX.Y.Z release"; exit 1; }
+            else
+              KUBO=$(gh api --paginate "repos/${KUBO_REPO}/releases" \
+                --jq '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+            fi
+            [ -n "$KUBO" ] || { echo "::error::no stable kubo release found"; exit 1; }
+
+            PREFIX="${KUBO}+build."
+            EXISTING=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name' \
+              | grep -F "$PREFIX" || true)
+            FORCE="${INPUT_FORCE:-false}"
+            if [ -z "$EXISTING" ]; then
+              REV=1; BUILD=true
+            else
+              MAX=$(echo "$EXISTING" | sed "s#.*+build\.##" | sort -n | tail -n1)
+              PREV_SHA=$(gh release view "${PREFIX}${MAX}" --repo "${GITHUB_REPOSITORY}" --json body \
+                --jq .body | sed -n 's/.*source_sha:[[:space:]]*//p' | tr -d '\r' | head -n1 || true)
+              if [ "$FORCE" = "true" ] || [ "$PREV_SHA" != "$SRC_SHA" ]; then
+                REV=$((MAX + 1)); BUILD=true
+              else
+                REV="$MAX"; BUILD=false
+              fi
+            fi
+            TAG="${PREFIX}${REV}"
+          fi
+
+          # Go toolchain: kubo's go.mod 'go' directive, completed to a full patch.
+          GODIR=$(curl -fsSL "https://raw.githubusercontent.com/${KUBO_REPO}/${KUBO}/go.mod" \
+            | awk '/^go [0-9]/{print $2; exit}')
+          if echo "$GODIR" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            GO_VERSION="$GODIR"
+          else
+            TV=$(curl -fsSL "https://raw.githubusercontent.com/ipfs/distributions/master/.tool-versions" \
+              | awk '/^golang /{print $2; exit}')
+            if echo "$TV" | grep -qE "^${GODIR}\."; then GO_VERSION="$TV"; else GO_VERSION="${GODIR}.0"; fi
+          fi
+
+          {
+            echo "should_build=$BUILD"
+            echo "tag=$TAG"
+            echo "kubo_version=$KUBO"
+            echo "go_version=$GO_VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::build=$BUILD tag=$TAG kubo=$KUBO go=$GO_VERSION"
+
+  test:
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "${{ needs.discover.outputs.go_version }}"
+          check-latest: true
+      - name: Start the WebDAV backend
+        run: docker compose up -d --wait webdav
+      - name: Unit + integration tests
+        env:
+          WEBDAV_TEST_URL: http://127.0.0.1:8091
+        run: |
+          go test ./...
+          go test -tags integration -timeout 600s ./...
+
+  build:
+    needs: [discover, test]
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        env:
+          TAG: ${{ needs.discover.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Docker tags forbid '+': v0.37.0+build.1 -> v0.37.0-build.1
+          echo "docker_tag=${TAG//+/-}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/kubo-ds-webdav" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (linux/amd64, webdavds bundled)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          KUBO: ${{ needs.discover.outputs.kubo_version }}
+          GO_VERSION: ${{ needs.discover.outputs.go_version }}
+          DOCKER_TAG: ${{ steps.meta.outputs.docker_tag }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg KUBO_VERSION="$KUBO" \
+            --build-arg GO_VERSION="$GO_VERSION" \
+            -t "${IMAGE}:${KUBO}" \
+            -t "${IMAGE}:${DOCKER_TAG}" \
+            -t "${IMAGE}:latest" \
+            .
+
+      - name: Extract the bundled ipfs binary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          KUBO: ${{ needs.discover.outputs.kubo_version }}
+        run: |
+          cid=$(docker create "${IMAGE}:${KUBO}")
+          BIN="kubo-ds-webdav_kubo-${KUBO}_linux-amd64"
+          docker cp "$cid:/usr/local/bin/ipfs" "$BIN"
+          docker rm "$cid" >/dev/null
+          chmod +x "$BIN"
+          sha256sum "$BIN" > "$BIN.sha256"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Push image to GHCR
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          KUBO: ${{ needs.discover.outputs.kubo_version }}
+          DOCKER_TAG: ${{ steps.meta.outputs.docker_tag }}
+        run: |
+          docker push "${IMAGE}:${KUBO}"
+          docker push "${IMAGE}:${DOCKER_TAG}"
+          docker push "${IMAGE}:latest"
+
+      - name: Compose release notes
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          KUBO: ${{ needs.discover.outputs.kubo_version }}
+          GO_VERSION: ${{ needs.discover.outputs.go_version }}
+          SRC_SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "<!-- build-meta"
+            echo "kubo_version: ${KUBO}"
+            echo "go_version: ${GO_VERSION}"
+            echo "source_sha: ${SRC_SHA}"
+            echo "-->"
+            echo
+            echo "kubo **${KUBO}** with the **webdavds** datastore compiled in (bundled)."
+            echo
+            echo "### Docker image (GHCR)"
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${KUBO}"
+            echo '```'
+            echo
+            echo "### Binary"
+            echo "\`kubo-ds-webdav_kubo-${KUBO}_linux-amd64\` is a drop-in \`ipfs\` (linux/amd64) with webdavds compiled in. Verify with the \`.sha256\`. See the README to configure the \`webdavds\` datastore."
+          } > notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.discover.outputs.tag }}
+          name: "kubo-ds-webdav · kubo ${{ needs.discover.outputs.kubo_version }}"
+          body_path: notes.md
+          make_latest: true
+          files: |
+            ${{ env.BIN }}
+            ${{ env.BIN }}.sha256
