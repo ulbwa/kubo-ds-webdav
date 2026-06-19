@@ -100,15 +100,20 @@ jobs:
             TAG="${PREFIX}${REV}"
           fi
 
-          # Go toolchain: kubo's go.mod 'go' directive, completed to a full patch.
-          GODIR=$(curl -fsSL "https://raw.githubusercontent.com/${KUBO_REPO}/${KUBO}/go.mod" \
-            | awk '/^go [0-9]/{print $2; exit}')
-          if echo "$GODIR" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          # Go toolchain kubo officially builds with. Prefer the explicit
+          # 'toolchain' directive (e.g. 'toolchain go1.25.4') — it is the exact,
+          # authoritative version; fall back to the 'go' directive completed to a
+          # full patch. This must match what kubo's deps (cockroachdb/swiss)
+          # support, so we pin it exactly rather than letting CI pick a newer Go.
+          GOMOD=$(curl -fsSL "https://raw.githubusercontent.com/${KUBO_REPO}/${KUBO}/go.mod")
+          TOOLCHAIN=$(printf '%s\n' "$GOMOD" | awk '/^toolchain go/{print $2; exit}')
+          GODIR=$(printf '%s\n' "$GOMOD" | awk '/^go [0-9]/{print $2; exit}')
+          if [ -n "$TOOLCHAIN" ]; then
+            GO_VERSION="${TOOLCHAIN#go}"
+          elif printf '%s' "$GODIR" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             GO_VERSION="$GODIR"
           else
-            TV=$(curl -fsSL "https://raw.githubusercontent.com/ipfs/distributions/master/.tool-versions" \
-              | awk '/^golang /{print $2; exit}')
-            if echo "$TV" | grep -qE "^${GODIR}\."; then GO_VERSION="$TV"; else GO_VERSION="${GODIR}.0"; fi
+            GO_VERSION="${GODIR}.0"
           fi
 
           {
@@ -124,12 +129,16 @@ jobs:
     if: needs.discover.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Pin the toolchain to exactly what kubo uses. The plugin package imports
+    # kubo -> cockroachdb/swiss, which fails to build on Go newer than kubo's
+    # toolchain, so we must not let go auto-upgrade to a newer Go.
+    env:
+      GOTOOLCHAIN: go${{ needs.discover.outputs.go_version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "${{ needs.discover.outputs.go_version }}"
-          check-latest: true
       - name: Start the WebDAV backend
         run: docker compose up -d --wait webdav
       - name: Unit + integration tests
