@@ -342,7 +342,14 @@ func isRetryableStatus(code int) bool {
 	switch code {
 	case http.StatusInternalServerError, // transient lock-DB / load failures
 		http.StatusTooManyRequests, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		// 423 Locked: DAV class-2 servers momentarily lock a collection while
+		// creating a child, so concurrent MKCOLs on sibling shard directories
+		// (and writes into a just-touched parent) transiently collide. This is
+		// lock contention, not a permanent state — the jittered backoff in
+		// withRetry lets the colliders converge. A genuinely held WebDAV lock
+		// still surfaces as an error once attempts are exhausted.
+		http.StatusLocked:
 		return true
 	}
 	return false

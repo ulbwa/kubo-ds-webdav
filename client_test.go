@@ -4,8 +4,44 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+
+	"golang.org/x/net/webdav"
 )
+
+// TestMkcolRetriesLocked simulates a DAV class-2 server that momentarily locks
+// the parent collection during concurrent shard-directory creation, returning
+// 423 Locked to a sibling MKCOL. The client must retry rather than abort the
+// whole batch (which is what breaks `ipfs add` of large files at concurrency>1).
+func TestMkcolRetriesLocked(t *testing.T) {
+	dav := &webdav.Handler{
+		FileSystem: webdav.NewMemFS(),
+		LockSystem: webdav.NewMemLS(),
+	}
+	var mkcols int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "MKCOL" && atomic.AddInt32(&mkcols, 1) == 1 {
+			http.Error(w, "Locked", http.StatusLocked)
+			return
+		}
+		dav.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := newClient(Config{URL: srv.URL, Concurrency: 4})
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	if err := c.mkcolRaw(context.Background(), "blocks"); err != nil {
+		t.Fatalf("mkcolRaw must retry 423 Locked, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&mkcols); got < 2 {
+		t.Fatalf("expected a retry after 423, only %d MKCOL(s) seen", got)
+	}
+}
 
 func TestClientPutGetSizeDelete(t *testing.T) {
 	cl := newTestClient(t)
