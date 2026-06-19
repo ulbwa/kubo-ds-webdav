@@ -212,23 +212,38 @@ jobs:
       - name: Compose release notes
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
+          DOCKER_TAG: ${{ steps.meta.outputs.docker_tag }}
           KUBO: ${{ needs.discover.outputs.kubo_version }}
           GO_VERSION: ${{ needs.discover.outputs.go_version }}
+          TAG: ${{ needs.discover.outputs.tag }}
           SRC_SHA: ${{ github.sha }}
         run: |
+          # The plugin has no semver of its own; it is identified by the source
+          # commit it was built from plus the build number (tag = v<kubo>+build.<N>).
+          BUILD="${TAG##*+build.}"
           {
             echo "<!-- build-meta"
             echo "kubo_version: ${KUBO}"
             echo "go_version: ${GO_VERSION}"
             echo "source_sha: ${SRC_SHA}"
+            echo "build: ${BUILD}"
             echo "-->"
             echo
             echo "kubo **${KUBO}** with the **webdavds** datastore compiled in (bundled)."
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Kubo version | \`${KUBO}\` |"
+            echo "| Go toolchain | \`${GO_VERSION}\` |"
+            echo "| kubo-ds-webdav source | \`${SRC_SHA}\` |"
+            echo "| Release tag | \`${TAG}\` |"
+            echo "| Build number | \`${BUILD}\` |"
             echo
             echo "### Docker image (GHCR)"
             echo '```bash'
             echo "docker pull ${IMAGE}:${KUBO}"
             echo '```'
+            echo "Tags: \`${KUBO}\`, \`${DOCKER_TAG}\`, \`latest\`."
             echo
             echo "### Binary"
             echo "\`kubo-ds-webdav_kubo-${KUBO}_linux-amd64\` is a drop-in \`ipfs\` (linux/amd64) with webdavds compiled in. Verify with the \`.sha256\`. See the README to configure the \`webdavds\` datastore."
